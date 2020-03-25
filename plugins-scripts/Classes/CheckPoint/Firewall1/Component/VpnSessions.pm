@@ -9,7 +9,7 @@ sub init {
 
 sub check {
   my ($self) = @_;
-  $self->add_info(sprintf '%.2f vpn sessions used', $self->{cpvIKECurrRespSAs});
+  $self->add_info(sprintf '%s vpn sessions (security associations) used', $self->{cpvIKECurrRespSAs});
   $self->set_thresholds(warning => 180, critical => 200);
   $self->add_message($self->check_thresholds($self->{cpvIKECurrRespSAs}));
   $self->add_perfdata(
