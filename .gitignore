@@ -51,3 +51,4 @@ dev_rfc.trc
 plugins-scripts/check_*_health.ptkdb
 walks
 .gitleaks.*
+specs

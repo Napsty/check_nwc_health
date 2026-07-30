@@ -1,3 +1,5 @@
+* 2026-07-30 12.13.2.1
+  reduce the queries for Huawei HUAWEI-ENTITY-EXTENT-MIB hardware-health
 * 2026-07-09 12.13.2
   add an AP cache for ArubaOS wlan-aps
 * 2026-07-07 12.13.1

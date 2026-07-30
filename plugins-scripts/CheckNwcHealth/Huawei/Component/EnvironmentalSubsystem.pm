@@ -30,45 +30,58 @@ sub init {
   # update april 2026: mit dem neuen SNMP-XS-Unterbau läuft 10x in Timeout.
   # Daher nicht mehr rumfummeln an den Parametern und die "nötigsten" Spalten fliegen auch raus.
   #$self->mult_snmp_max_msg_size(10);
-  foreach (qw(modules fans powersupplies)) {
-    # we need to get the table inside the loop, as merge_table deletes
-    # entitystates. get_snmp_tables will read from the cache.
-    $self->get_snmp_tables('HUAWEI-ENTITY-EXTENT-MIB', [
-        ['entitystates', 'hwEntityStateTable', 'Monitoring::GLPlugin::SNMP::TableItem'],
-	#   "hwEntityOperStatus", "hwEntityAdminStatus", "hwEntityAlarmLight",
-	#    "hwEntityTemperature", "hwEntityTemperatureLowThreshold",
-	#    "hwEntityTemperatureMinorThreshold", "hwEntityTemperatureThreshold",
-	#    "hwEntityFaultLight", "hwEntityDeviceStatus",
-    ]);
-    $self->debug(sprintf "found %d %s", scalar(@{$self->{entitystates}}), "entitystates");
-    $self->debug(sprintf "found %d %s", scalar(@{$self->{$_}}), $_);
-    $self->merge_tables($_, "entitystates");
-  }
+
+  # hwFanStatusTable alone already has everything we need to judge fan health
+  # (presence + state), whether a fan has one blade or two. The fan-class rows
+  # in entPhysicalTable are a different, redundant inventory (see investigation
+  # in this session: they don't correlate by name or index with hwFanStatusTable
+  # at all on some devices) that we don't need to query hwEntityStateTable for.
+  # So: try hwFanStatusTable first. If it gives us present fans, entPhysicalTable's
+  # fan entries are ignored entirely (not even added to @all_indices below).
+  # Only fall back to entPhysicalTable's fans if hwFanStatusTable is empty or
+  # has no present fans.
   $self->get_snmp_tables('HUAWEI-ENTITY-EXTENT-MIB', [
       ['fanstates', 'hwFanStatusTable', 'CheckNwcHealth::Huawei::Component::EnvironmentalSubsystem::FanStatus']
   ]);
-  $self->debug(sprintf "found %d %s", scalar(@{$self->{fanstates}}), "fanstates");
-  if (@{$self->{fanstates}} && ! @{$self->{fans}}) {
-    # gibts auch, d.h. retten, was zu retten ist
-    @{$self->{fanstates}} = grep {
-      $_->{hwEntityFanPresent} eq "present";
-    } @{$self->{fanstates}};
+  @{$self->{fanstates}} = grep {
+    $_->{hwEntityFanPresent} eq "present";
+  } @{$self->{fanstates}};
+  $self->debug(sprintf "found %d present %s", scalar(@{$self->{fanstates}}), "fanstates");
+  if (@{$self->{fanstates}}) {
+    # done with fans via hwFanStatusTable; entPhysicalTable's fan entries
+    # would otherwise be checked a second time, so drop them.
+    delete $self->{fans};
   } else {
-    $self->merge_tables_with_code("fans", "fanstates", sub {
-      my ($fan, $fanstate) = @_;
-      return ($fan->{entPhysicalName} eq sprintf("FAN %d/%d",
-          $fanstate->{hwEntityFanSlot}, $fanstate->{hwEntityFanSn})) ? 1 : 0;
-    });
-    if (grep { exists $_->{hwEntityFanState} } @{$self->{fans}}) {
-      # fans and fanstates matched, check fans
-    } else {
-      # $fan->{entPhysicalName} and $fanstate->{Slot/Sn} were different
-      # there was also a device with 4 fans and 8 fanstates. Dreck!
-      # better check fanstates
-      $self->get_snmp_tables('HUAWEI-ENTITY-EXTENT-MIB', [
-          ['fanstates', 'hwFanStatusTable', 'CheckNwcHealth::Huawei::Component::EnvironmentalSubsystem::FanStatus']
-      ]);
-      delete $self->{fans};
+    # no (present) fans in hwFanStatusTable -- fall back to entPhysicalTable's
+    # fan entries, enriched via hwEntityStateTable below like modules/powersupplies.
+    delete $self->{fanstates};
+  }
+
+  my @all_indices;
+  foreach my $type (qw(modules fans powersupplies)) {
+    # exists-check first: @{$self->{$type}} alone would autovivify a
+    # just-deleted key (e.g. fans, above) back into an empty arrayref.
+    next if ! exists $self->{$type};
+    foreach my $entry (@{$self->{$type}}) {
+      push @all_indices, [$entry->{flat_indices}];
+    }
+  }
+  if (@all_indices) {
+    $self->debug(sprintf "searching entitystates for %d indices", scalar(@all_indices));
+    my @entitystates_cache = $self->get_snmp_table_objects(
+        'HUAWEI-ENTITY-EXTENT-MIB', 'hwEntityStateTable', \@all_indices, [
+        "hwEntityOperStatus", "hwEntityAdminStatus", "hwEntityAlarmLight",
+        "hwEntityTemperature", "hwEntityTemperatureLowThreshold",
+        "hwEntityTemperatureMinorThreshold", "hwEntityTemperatureThreshold",
+        "hwEntityFaultLight", "hwEntityDeviceStatus",
+    ]);
+    my $cached = [map { { %{$_} } } @entitystates_cache];
+    $self->debug(sprintf "found %d entitystates", scalar(@{$cached}));
+    foreach (qw(modules fans powersupplies)) {
+      next if ! exists $self->{$_};
+      $self->{entitystates} = [map { { %{$_} } } @{$cached}];
+      $self->debug(sprintf "found %d %s", scalar(@{$self->{$_}}), $_);
+      $self->merge_tables($_, "entitystates");
     }
   }
 }
@@ -85,6 +98,7 @@ sub finish {
 }
 
 sub check {
+  # this kind of fan comes from hwFanStatusTable
   my ($self) = @_;
   $self->add_info(sprintf 'fan %s state is %s',
       $self->{name},
@@ -191,22 +205,57 @@ our @ISA = qw(CheckNwcHealth::Huawei::Component::EnvironmentalSubsystem::Entity)
 use strict;
 
 sub check {
+  # This kind of fan comes from entPhysicalTable+hwEntityStateTable, which is
+  # only used as a fallback when hwFanStatusTable was empty (see init).
+  # hwEntityFanPresent/-State/-Speed live in hwFanStatusTable and are therefore
+  # NOT available here -- asking for them produced uninitialized-warnings.
+  # A row in entPhysicalTable means the fan is plugged in, and the only health
+  # signal hwEntityStateTable offers for a fan is hwEntityOperStatus (plus the
+  # alarm/fault lights, which real fans usually report as notSupported).
+  # There is no speed column at all, so no rpm perfdata on this path.
+  #
+  # TODO/offen -- die Sache mit dem absent(19):
+  # HwOperState kennt neben disabled(2)/enabled(3)/offline(4) auch ein
+  # absent(19), das die Vaterklasse Entity::check() (noch) nicht bemaengelt.
+  # Und jetzt kommts: present(18) und absent(19) sind nirgends dokumentiert.
+  # Die TEXTUAL-CONVENTION HwOperState erklaert brav und ausfuehrlich jeden
+  # anderen Wert, sogar das up/down/connect, das eh nur ein NE5000E im
+  # Ruecken-an-Ruecken-Betrieb je hergibt -- und ueber die zwei am Schluss
+  # schweigt sie wie ein Grantler beim Fruehschoppen. In der MIB-Quelle genauso
+  # wie in der S7700 MIB Reference (Issue 02, 2025-09-22). Da hat sich einer bei
+  # Huawei ans Enum-Ende zwei Werte hingeschlampt und sich das Hirnschmalz fuer
+  # die Beschreibung gspart. Sauber. hwEntityOperStatus ist obendrein der
+  # einzige Nutzer vom TC, es gibt also kein Geschwisterobjekt, das einem aus
+  # dem Schmarrn heraushelfen wuerde.
+  # Zwei Lesarten, und die unterscheiden sich fei in der Konsequenz:
+  #   a) "da war nie was drin" -- die Kiste kam ab Werk mit leerem Schacht.
+  #      Dann waer eine Warnung nix wie Krach um garnix.
+  #   b) "war drin und ist jetzt weg" -- dann gehoert gewarnt.
+  # Fuer b) spricht, dass Huawei im HUAWEI-DC-TRAP-MIB ein Paerchen
+  # hwFanAbsent (hwDCTraps 53) / hwFanAbsentResume (54) fuehrt. Ein Absent mit
+  # zugehoerigem Resume ist ein kommendes und gehendes Ereignis und kein
+  # Inventar-Merkmal -- ein ab Werk leerer Schacht feuert sowas nie.
+  # Fuer a) bzw. dagegen, dass absent hier ueberhaupt Luefter meint, spricht die
+  # Position im Enum: 16=linkUp, 17=linkDown, 18=present, 19=absent, das schaut
+  # doch nach dem Steckstatus von einem Transceiver an einem Port-Entity aus.
+  # Und wo Huawei wirklich Luefter-Anwesenheit meint, gibts ein eigenes,
+  # ordentlich dokumentiertes Objekt (hwEntityFanPresent, "the fan in-position
+  # status"). Waer ja auch zu einfach gwesen, das gleich hier reinzuschreiben.
+  # In saemtlichen Walks der Sammlung kam absent(19) noch kein einzigs Mal vor
+  # (nur enabled, linkDown, protocolUp, disabled), drum wird hier nix auf
+  # Verdacht implementiert -- ich bin ja koa Gscheidhaferl. Wer irgendwann einen
+  # Haufen Huawei-Geraete durchscannt und einen Luefter mit absent findet: beim
+  # Besitzer nachfragen, ob da tatsaechlich ein Teil hin bzw. gezogen ist.
+  # Bestaetigt sich das, gehoert hier ein add_warning() hin -- und zwar nur da
+  # herin im Fan und ja nicht in Entity::check(), denn leere Schaechte sind bei
+  # Modulen und Netzteilen voellig normal, und dann steht gleich wieder die
+  # ganze Bagage da und mimimit.
   my ($self) = @_;
   $self->finish_after_merge();
-  $self->add_info(sprintf 'fan %s is %s, state is %s, admin status is %s, oper status is %s',
-      $self->{entPhysicalName}, $self->{hwEntityFanPresent},
-      $self->{hwEntityFanState},
+  $self->add_info(sprintf 'fan %s admin status is %s, oper status is %s',
+      $self->{entPhysicalName},
       $self->{hwEntityAdminStatus}, $self->{hwEntityOperStatus});
-  if ($self->{hwEntityFanPresent} eq 'present') {
-    if ($self->{hwEntityFanState} ne 'normal') {
-      $self->add_warning();
-    }
-    $self->add_perfdata(
-        label => 'rpm_'.$self->{entPhysicalName},
-        value => $self->{hwEntityFanSpeed},
-        uom => '%',
-    );
-  }
+  $self->SUPER::check();
 }
 
 
