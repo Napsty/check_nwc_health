@@ -62,6 +62,20 @@ sub check {
           defined $self->opts->mitigation() ? $self->opts->mitigation() : WARNING,
           'ha was not started');
     }
+
+    # PERFDATA: ha_started = 1 if HA started, 0 otherwise. Consumed by Grafana/Icinga dashboards.
+    my $ha_started_val = ($self->{haStarted} eq 'yes') ? 1 : 0;
+    $self->add_perfdata(
+        label => 'ha_started',
+        value => $ha_started_val,
+    );
+
+    # PERFDATA: ha_healthy = 1 if HA status OK, 0 otherwise. Consumed by Grafana/Icinga dashboards and alerting.
+    my $ha_healthy_val = ($self->{haStatShort} eq 'OK') ? 1 : 0;
+    $self->add_perfdata(
+        label => 'ha_healthy',
+        value => $ha_healthy_val,
+    );
   }
 }
 
